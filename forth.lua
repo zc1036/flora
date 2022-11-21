@@ -3,7 +3,27 @@ local Object = require 'classic'
 
 -- [[ Utilities ]]
 
-local function match(v, ...)
+local function tabletostring(o)
+  if type(o) == 'table' then
+    if getmetatable(o) and getmetatable(o).__tostring then
+      return tostring(o)
+    end
+     local s = '{ '
+     for k,v in pairs(o) do
+        if type(k) ~= 'number' then k = '"'..tostring(k)..'"' end
+        s = s .. '['..k..'] = ' .. tabletostring(v) .. ','
+     end
+     return s .. '} '
+  else
+     return tostring(o)
+  end
+end
+
+local function printtable(o)
+  print(tabletostring(o))
+end
+
+local function mtch(v, ...)
   local matchers = { ... }
 
   for i = 1, #matchers, 2 do
@@ -12,6 +32,8 @@ local function match(v, ...)
     end
   end
 end
+
+local match = mtch
 
 local function iota(start, stop, step, fn)
   step = step or 1
@@ -75,7 +97,7 @@ function FString:new(s)
 end
 
 function FString:__tostring()
-  return '"' .. self.value .. '"'
+  return 'FS."' .. self.value .. '"'
 end
 
 local FNumeric = FObject:extend()
@@ -85,17 +107,18 @@ function FNumeric:new(n)
 end
 
 function FNumeric:__tostring()
-  return tostring(self.value)
+  return 'FN.' .. tostring(self.value)
 end
 
 local FSymbol = FObject:extend()
 
 function FSymbol:new(repr)
+  assert(repr and type(repr) == 'string', 'Expected string, got ' .. type(repr))
   self.value = repr
 end
 
 function FSymbol:__tostring()
-  return self.value
+  return 'FS.' .. self.value
 end
 
 local FCons = FObject:extend()
@@ -138,7 +161,7 @@ function FCons:__tostring()
   end
 
   str = str .. ']'
-  
+
   return str
 end
 
@@ -273,34 +296,34 @@ end
 
 -- [[ Compiler ]]
 
+local FunctionDefinition
+
 local Compiler = Object:extend()
 
-local function compile_fn(c)
+function Compiler:compile_fn()
   local all_compiled = {}
 
-  local name = read(c.file)
+  local fname = read(self.file)
 
-  assert(name, 'End of file while compiling fn, expecting name')
-  assert(name:is(FSymbol), 'Error while compiling fn, expecting symbol name')
+  assert(fname, 'End of file while compiling fn, expecting name')
+  assert(fname:is(FSymbol), 'Error while compiling fn, expecting symbol name')
 
-  local sym = c:gensym()
+  self:push_scope()
 
-  c:add_name(name.value, sym)
+  local argnum = self:num_argvalues(fname.value)
+  local retnum = self:num_returnvalues(fname.value)
+  local argnames = iota(1, argnum, 1, function() return self:gensym('arg') end)
 
-  c:push_scope()
+  table.insert(all_compiled, 'local ' .. fname.value .. ' = function(' .. table.concat(argnames, ', ') .. ')')
 
-  local argnum = c:num_argvalues(name.value)
-  local retnum = c:num_returnvalues(name.value)
-  local argnames = iota(1, argnum, 1, function() return c:gensym('arg') end)
-
-  table.insert(all_compiled, 'local ' .. sym .. ' = function(' .. table.concat(argnames, ', ') .. ')')
-
-  for k,v in ipairs(argnames) do
-    c:pushstackvar(v)
+  for _,v in ipairs(argnames) do
+    self:pushstackvar(v)
   end
 
+  local objects = {}
+
   while true do
-    local obj = read(c.file)
+    local obj = read(self.file)
 
     assert(obj, 'End of file while compiling fn')
 
@@ -308,27 +331,39 @@ local function compile_fn(c)
       break
     end
 
-    local compiled = c:compile(obj)
+    table.insert(objects, obj)
+  end
 
+  local constraints, intermediate_type_vars = self.typechecker:typecheck(FunctionDefinition(fname, objects))
+
+  printtable(constraints)
+  printtable(intermediate_type_vars)
+  printtable(self.typechecker.var_name_to_type_var)
+
+  for _,obj in ipairs(objects) do
+    local compiled = self:compile(obj)
     table.insert(all_compiled, compiled)
   end
 
-  table.insert(all_compiled, 'return ' .. table.concat(iota(1, retnum, 1, function(i) return c:stackvar(i) end), ', '))
+  table.insert(all_compiled, 'return ' .. table.concat(iota(1, retnum, 1, function(i) return self:stackvar(i) end), ', '))
   table.insert(all_compiled, 'end')
 
-  c:pop_scope()
+  self:pop_scope()
 
   return table.concat(all_compiled, '\n')
 end
+
+local TypeChecker
 
 function Compiler:new(f)
   self.file = f
   self.nextvar = 0
   self.lexicon = {{}}
   self.stackvarnames = {{}}
+  self.typechecker = TypeChecker()
 
   self.builtins = {
-    fn = compile_fn
+    fn = function(...) self:compile_fn(...) end
   }
 end
 
@@ -341,7 +376,7 @@ function Compiler:opcode_call(name)
 
   self:popstackvars(numargs)
 
-  for k,v in ipairs(rets) do
+  for _,v in ipairs(rets) do
     self:pushstackvar(v)
   end
 
@@ -362,8 +397,8 @@ end
 
 function Compiler:stackvar(n)
   local names = self.stackvarnames[#self.stackvarnames]
-  assert(#names + 1 - n >= 1, 'Invalid argument ' .. n .. ' to stackvar')
-  assert(#names + 1 - n <= #names, 'Invalid argument ' .. n .. ' to stackvar')
+  assert(#names + 1 - n >= 1, 'Invalid argument (underflow) ' .. n .. ' to stackvar')
+  assert(#names + 1 - n <= #names, 'Invalid argument (overflow) ' .. n .. ' to stackvar')
   return names[#names + 1 - n]
 end
 
@@ -382,6 +417,15 @@ end
 
 function Compiler:add_name(name, value)
   self.lexicon[#self.lexicon][name] = value
+end
+
+function Compiler:lookup_name(name)
+  for i = #self.lexicon, 1, -1 do
+    local val = self.lexicon[i][name]
+    if val then
+      return val
+    end
+  end
 end
 
 function Compiler:push_scope()
@@ -403,24 +447,209 @@ function Compiler:gensym(t)
 end
 
 function Compiler:compile(obj)
-  if obj then
-    return match(obj,
-          FNumeric, function()
-            local v = self:gensym('num')
-            self:pushstackvar(v)
-            return 'local ' .. v .. ' = ' .. obj.value
-          end,
-          FSymbol, function()
-            if self.builtins[obj.value] then
-              return self.builtins[obj.value](self)
-            else
-              return self:opcode_call(obj.value)
-            end
-          end,
-          Object, function()
-            assert(false, "Unrecognized object type" .. tostring(obj))
-          end)
+  assert(obj, "Compiler:compile expected object, got nil")
+
+  return mtch(obj,
+              FNumeric, function()
+                local v = self:gensym('num')
+                self:pushstackvar(v)
+                return 'local ' .. v .. ' = ' .. obj.value
+              end,
+              FSymbol, function()
+                if self.builtins[obj.value] then
+                  return self.builtins[obj.value](self)
+                else
+                  return self:opcode_call(obj.value)
+                end
+              end,
+              Object, function()
+                assert(false, "Unrecognized object type " .. tostring(obj))
+              end)
+end
+
+local ASTNode = Object:extend()
+
+FunctionDefinition = ASTNode:extend()
+
+function FunctionDefinition:new(fname --[[FSymbol]], body --[[table]])
+  assert(fname and fname:is(FSymbol))
+  assert(body and type(body) == 'table')
+  self.fname, self.body = fname, body
+end
+
+local TypeAST = Object:extend()
+
+local TypeFunction = TypeAST:extend()
+
+function TypeFunction:new(args, rets)
+  assert(args and type(rets) == 'number')
+  assert(rets and type(rets) == 'number')
+
+  self.args, self.rets = args, rets
+end
+
+function TypeFunction:__tostring()
+  return 'TFn[' .. self.args .. ' -> ' .. self.rets .. ']'
+end
+
+local TypeCons = TypeAST:extend()
+
+function TypeCons:new(car, cdr)
+  assert(car and type(car) == 'number')
+  assert(cdr and type(cdr) == 'number')
+
+  self.car, self.cdr = car, cdr
+end
+
+function TypeCons:__tostring()
+  return '(' .. self.car .. ' . ' .. self.cdr .. ')'
+end
+
+local TypeAtom = TypeAST:extend()
+
+function TypeAtom:new(name)
+  assert(name and type(name) == 'string')
+  self.name = name
+end
+
+function TypeAtom:__tostring()
+  return 'Atom[' .. self.name .. ']'
+end
+
+local Constraint = Object:extend()
+
+local ConstraintsEqual = Constraint:extend()
+
+function ConstraintsEqual:new(lhs, rhs)
+  assert(lhs and type(lhs) == "number")
+  assert(rhs and type(rhs) == "number")
+  self.lhs, self.rhs = lhs, rhs
+end
+
+function ConstraintsEqual:__tostring()
+  return self.lhs .. ' =T= ' .. self.rhs
+end
+
+local ConstraintIs = Constraint:extend()
+
+function ConstraintIs:new(variable, t)
+  assert(variable and type(variable) == 'number')
+  assert(t and t:is(TypeAST))
+
+  self.variable, self.t = variable, t
+end
+
+function ConstraintIs:__tostring()
+  return self.variable .. ' =I= ' .. tostring(self.t)
+end
+
+TypeChecker = Object:extend()
+
+function TypeChecker:new()
+  self.next_scope = 1
+  self.scopes = {0}
+
+  self.next_type_var = 0
+  self.var_name_to_type_var = {}
+
+  self.atom_cache = {}
+  self.atom_name_to_type_var = {}
+end
+
+function TypeChecker:get_name_var(name)
+  return self.var_name_to_type_var[name]
+end
+
+function TypeChecker:get_or_create_name_var(name)
+  assert(name and type(name) == 'string', 'Expected string, got ' .. type(name))
+
+  local var = self:get_name_var(name)
+
+  if not var then
+    var = self:getnexttypevar()
+    self.var_name_to_type_var[name] = var
   end
+
+  return var
+end
+
+function TypeChecker:get_or_create_atom(name)
+  if self.atom_cache[name] then
+    return self.atom_cache[name]
+  end
+  self.atom_cache[name] = TypeAtom(name)
+  return self.atom_cache[name]
+end
+
+function TypeChecker:push_scope()
+  self.next_type_var = self.next_type_var + 1
+  table.insert(self.scopes, self.next_type_var)
+end
+
+function TypeChecker:pop_scope()
+  table.remove(self.scopes)
+end
+
+function TypeChecker:getnexttypevar()
+  self.next_type_var = self.next_type_var + 1
+  return self.next_type_var + (self.scopes[#self.scopes] * 0x100000000)
+end
+
+function TypeChecker:check_function_definition(ast, constraints, intermediate_type_vars)
+  assert(ast and ast:is(FunctionDefinition))
+
+  local defins = self:getnexttypevar()
+
+  local firstins, lastouts = nil, defins
+
+  for _,v in ipairs(ast.body) do
+    local fntype, ins, outs = self:getnexttypevar(), self:getnexttypevar(), self:getnexttypevar()
+
+    firstins = firstins or ins
+    table.insert(constraints, ConstraintIs(fntype, TypeFunction(ins, outs)))
+    table.insert(constraints, ConstraintsEqual(ins, lastouts))
+
+    match(v,
+          FSymbol, function()
+            local fnnamedtype = self:get_or_create_name_var(v.value)
+            table.insert(constraints, ConstraintsEqual(fntype, fnnamedtype))
+          end,
+          FNumeric, function()
+            local numeric_atom = self:get_or_create_atom('number')
+            local numeric_var, rest = self:getnexttypevar(), self:getnexttypevar()
+            local numeric_rettype = TypeCons(numeric_var, rest)
+
+            table.insert(constraints, ConstraintIs(numeric_var, numeric_atom))
+            table.insert(constraints, ConstraintIs(outs, numeric_rettype))
+            table.insert(constraints, ConstraintsEqual(rest, ins))
+          end,
+          FObject, function()
+            assert(false)
+          end)
+    lastouts = outs
+
+    intermediate_type_vars[v] = fntype
+  end
+
+  local fnid = self:get_or_create_name_var(ast.fname.value)
+
+  table.insert(constraints, ConstraintIs(fnid, TypeFunction(firstins, lastouts)))
+end
+
+function TypeChecker:typecheck(ast --[[ASTNode]])
+  assert(ast and ast:is(ASTNode))
+
+  local constraints, intermediate_type_vars = {}, {}
+
+  match(ast,
+        FunctionDefinition, function()
+          self:check_function_definition(ast, constraints, intermediate_type_vars)
+        end,
+        Object, function()
+          assert(false)
+        end)
+
+  return constraints, intermediate_type_vars
 end
 
 local c = Compiler(Infile(io.input()))

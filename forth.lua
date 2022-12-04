@@ -3,6 +3,53 @@ local Object = require 'classic'
 
 -- [[ Utilities ]]
 
+local Bimap = Object:extend()
+
+function Bimap:new()
+  self.key_to_value = {}
+  self.value_to_keys = {}
+end
+
+function Bimap:add(k, v)
+  self:remove(k)
+  self.key_to_value[k] = v
+
+  local keys = self.value_to_keys[v]
+  if not keys then
+    keys = {}
+    self.value_to_keys[v] = keys
+  end
+
+  keys[k] = true
+end
+
+function Bimap:remove(k)
+  local value = self.key_to_value[k]
+
+  if not value then
+    return
+  end
+
+  self.key_to_value[k] = nil
+  self.value_to_keys[value][k] = nil
+end
+
+function Bimap:value_at(k)
+  return self.key_to_value[k]
+end
+
+local function array_copy(tbl)
+  local tbl = {}
+  for k, v in ipairs(tbl) do
+    tbl[k] = v
+  end
+  return tbl
+end
+
+function Bimap:keys_at(v)
+  return array_copy(self.value_to_keys[v])
+end
+
 local function tabletostring(o)
   if type(o) == 'table' then
     if getmetatable(o) and getmetatable(o).__tostring then
@@ -50,6 +97,18 @@ local function map(tbl, fn)
   local newtbl = {}
   for k,v in pairs(tbl) do
     newtbl[k] = fn(v)
+  end
+  return newtbl
+end
+
+local function filter(tbl, fn)
+  local newtbl = {}
+  local i = 1
+  for _,v in ipairs(tbl) do
+    if fn(v) then
+      newtbl[i] = v
+      i = i + 1
+    end
   end
   return newtbl
 end
@@ -334,11 +393,15 @@ function Compiler:compile_fn()
     table.insert(objects, obj)
   end
 
+  print('type checking')
   local constraints, intermediate_type_vars = self.typechecker:typecheck(FunctionDefinition(fname, objects))
 
   printtable(constraints)
   printtable(intermediate_type_vars)
   printtable(self.typechecker.var_name_to_type_var)
+
+  print('unifying')
+  self.typechecker:unify(constraints)
 
   for _,obj in ipairs(objects) do
     local compiled = self:compile(obj)
@@ -363,7 +426,7 @@ function Compiler:new(f)
   self.typechecker = TypeChecker()
 
   self.builtins = {
-    fn = function(...) self:compile_fn(...) end
+    fn = function() self:compile_fn() end
   }
 end
 
@@ -530,6 +593,19 @@ function ConstraintsEqual:__tostring()
   return self.lhs .. ' =T= ' .. self.rhs
 end
 
+local ConstraintSubset = Constraint:extend()
+
+function ConstraintSubset:new(element_type, set_type)
+  assert(element_type and type(element_type) == 'number')
+  assert(set_type and type(set_type) == 'number')
+
+  self.element, self.set = element_type, set_type
+end
+
+function ConstraintSubset:__tostring()
+  return self.element .. ' ∈ ' .. self.set
+end
+
 local ConstraintIs = Constraint:extend()
 
 function ConstraintIs:new(variable, t)
@@ -553,7 +629,6 @@ function TypeChecker:new()
   self.var_name_to_type_var = {}
 
   self.atom_cache = {}
-  self.atom_name_to_type_var = {}
 end
 
 function TypeChecker:get_name_var(name)
@@ -612,7 +687,7 @@ function TypeChecker:check_function_definition(ast, constraints, intermediate_ty
     match(v,
           FSymbol, function()
             local fnnamedtype = self:get_or_create_name_var(v.value)
-            table.insert(constraints, ConstraintsEqual(fntype, fnnamedtype))
+            table.insert(constraints, ConstraintSubset(fntype, fnnamedtype))
           end,
           FNumeric, function()
             local numeric_atom = self:get_or_create_atom('number')
@@ -650,6 +725,60 @@ function TypeChecker:typecheck(ast --[[ASTNode]])
         end)
 
   return constraints, intermediate_type_vars
+end
+
+function TypeChecker:unify(constraints)
+  local renames = Bimap()
+
+  local function resolvevar(x)
+    return renames:value_at(x) or x
+  end
+
+  for _,constraint in ipairs(constraints) do
+    match(constraint,
+          ConstraintsEqual, function()
+            local lhs, rhs = resolvevar(constraint.lhs), resolvevar(constraint.rhs)
+
+            if lhs ~= rhs then
+              for _,oldrename in ipairs(renames:keys_at(lhs)) do
+                renames:add(oldrename, rhs)
+              end
+              renames:add(lhs, rhs)
+            end
+          end,
+          Constraint, function()
+            -- Do nothing with other constraints
+          end)
+  end
+
+  constraints = filter(constraints, function(v) return not v:is(ConstraintsEqual) end)
+
+  for _,constraint in ipairs(constraints) do
+    match(constraint,
+          ConstraintSubset, function()
+            constraint.set = renames:value_at(constraint.set) or constraint.set
+            constraint.element = renames:value_at(constraint.element) or constraint.element
+          end,
+          ConstraintIs, function()
+            constraint.variable = renames:value_at(constraint.variable) or constraint.variable
+
+            match(constraint.t,
+                  TypeFunction, function()
+                    constraint.t.args = renames:value_at(constraint.t.args) or constraint.t.args
+                    constraint.t.rets = renames:value_at(constraint.t.rets) or constraint.t.rets
+                  end,
+                  TypeCons, function()
+                    constraint.t.car = renames:value_at(constraint.t.car) or constraint.t.car
+                    constraint.t.cdr = renames:value_at(constraint.t.cdr) or constraint.t.cdr
+                  end)
+          end,
+          Object, function()
+            assert('unexpected constraint type')
+          end)
+  end
+
+  printtable(renames.key_to_value)
+  printtable(constraints)
 end
 
 local c = Compiler(Infile(io.input()))
